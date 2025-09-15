@@ -155,51 +155,44 @@ def get_yt_dlp_opts(download=False, audio_only=False, quality='best'):
         'quiet': True,
         'no_warnings': True,
         'extract_flat': True if not download else False,
+        'format_sort': ['res:1080', 'ext:mp4:m4a'],
         'nocheckcertificate': True,
+        'ignoreerrors': True,
         'no_check_certificate': True,
-        'extractor_retries': 5,
-        'ignore_no_formats_error': True,
-        'http_chunk_size': 10485760,  # 10MB per chunk
+        'extract_flat': True if not download else False,
         'retries': 10,
         'fragment_retries': 10,
-        'skip_unavailable_fragments': True,
-        'overwrites': True,
-        'cachedir': False,
-        'no_cache_dir': True,
-        'rm_cache_dir': True,
-        'extractor_args': {
-            'youtube': {
-                'skip': ['dash', 'hls'],
-                'player_skip': ['js', 'configs', 'webpage']
-            }
-        },
+        'file_access_retries': 5,
+        'http_chunk_size': 10485760,
+        'concurrent_fragments': 1,
+        'cookiesfrombrowser': ('chrome',),
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
-            'Sec-Fetch-Mode': 'navigate',
-            'Connection': 'keep-alive'
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate'
         }
     }
     
     if not download:
         return common_opts
-        
+
     if audio_only:
         format_opts = {
-            'format': 'bestaudio/best',
+            'format': 'bestaudio[ext=m4a]/bestaudio',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'm4a',
             }]
         }
     else:
+        # Simplified format selection to avoid extraction issues
         if quality == 'best':
-            format_str = 'best[height<=1080]'
+            format_str = 'best[height<=1080][ext=mp4]/best[height<=1080]/best'
         elif quality == 'medium':
-            format_str = 'best[height<=720]'
+            format_str = 'best[height<=720][ext=mp4]/best[height<=720]/best'
         else:  # low
-            format_str = 'best[height<=480]'
+            format_str = 'best[height<=480][ext=mp4]/best[height<=480]/best'
             
         format_opts = {
             'format': format_str,
@@ -262,58 +255,57 @@ def download_video(url, quality='best', audio_only=False):
         for attempt in range(max_retries):
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    # First try to extract info to validate the URL
+                    # Try simple format first
                     try:
                         info = ydl.extract_info(url, download=False)
                         if not info:
                             raise Exception("Could not extract video information")
+                            
+                        # If we got info, try downloading
+                        error = ydl.download([url])
+                        if error == 0:
+                            return True, str(downloads_dir)
+                            
                     except Exception as e:
-                        if "Failed to extract any player response" in str(e):
-                            # Try with simpler format options
-                            ydl_opts['format'] = 'best' if not audio_only else 'bestaudio'
-                            ydl_opts['extractor_args'] = {'youtube': {'skip': ['dash', 'hls']}}
-                            continue
-                        raise
-                    
-                    # If info extraction succeeded, proceed with download
-                    error = ydl.download([url])
-                    if error == 0:
-                        return True, str(downloads_dir)
-                    
+                        if "No video formats found" in str(e) or "Failed to extract" in str(e):
+                            # Try with simpler format
+                            ydl_opts['format'] = 'best/bestaudio'
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                                error = ydl2.download([url])
+                                if error == 0:
+                                    return True, str(downloads_dir)
+                        else:
+                            raise
+                            
             except Exception as e:
                 if attempt < max_retries - 1:
-                    if "HTTP Error 403" in str(e):
-                        # Try with different format on next attempt
-                        ydl_opts['format'] = 'best' if not audio_only else 'bestaudio'
+                    if any(x in str(e) for x in ["HTTP Error 403", "Error extracting", "No video formats"]):
+                        # Try with different format and delay
+                        ydl_opts['format'] = 'best'
                         time.sleep(retry_delay * (attempt + 1))
                         continue
-                    elif "Failed to extract" in str(e):
-                        # Try without extra YouTube parameters
-                        ydl_opts.pop('extractor_args', None)
-                        time.sleep(retry_delay)
-                        continue
-                raise
+                    else:
+                        raise
+                else:
+                    raise
         
         return False, "Failed to download after multiple attempts"
         
     except Exception as e:
         error_msg = str(e)
         if "HTTP Error 403" in error_msg:
-            error_msg = "Access denied by YouTube. This might be due to:\n" + \
-                       "1. Regional restrictions\n" + \
-                       "2. Age-restricted content\n" + \
-                       "3. Private video\n" + \
+            error_msg = "YouTube denied access. This could be due to:\n" + \
+                       "1. Video restrictions\n" + \
+                       "2. Regional restrictions\n" + \
                        "Please try:\n" + \
-                       "- A different video quality setting\n" + \
-                       "- Waiting a few minutes\n" + \
-                       "- Using a different video"
-        elif "Failed to extract" in error_msg:
-            error_msg = "Failed to extract video information. This might be due to:\n" + \
-                       "1. YouTube API changes\n" + \
-                       "2. Video restrictions\n" + \
-                       "Please try:\n" + \
-                       "- Using a different quality setting\n" + \
-                       "- Using a different video URL"
+                       "- A different video quality\n" + \
+                       "- Using audio-only download\n" + \
+                       "- A different video URL"
+        elif "No video formats found" in error_msg:
+            error_msg = "Could not find suitable video format. Please try:\n" + \
+                       "- A lower quality setting\n" + \
+                       "- Audio-only download\n" + \
+                       "- A different video URL"
         return False, error_msg
 
 def format_duration(seconds):
