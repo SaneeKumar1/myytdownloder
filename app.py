@@ -4,6 +4,8 @@ import os
 import tempfile
 from pathlib import Path
 import time
+import random
+from datetime import datetime
 
 # Set page config
 st.set_page_config(
@@ -146,29 +148,95 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Configure yt-dlp with custom headers and cookies
+def get_yt_dlp_opts(download=False, audio_only=False, quality='best'):
+    """Get yt-dlp options with proper configuration"""
+    # Rotate User-Agents
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36 Edg/116.0.1938.69'
+    ]
+    
+    common_opts = {
+        'nocheckcertificate': True,
+        'no_warnings': True,
+        'quiet': True,
+        'no_color': True,
+        'http_headers': {
+            'User-Agent': random.choice(user_agents),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+        },
+        'socket_timeout': 30,
+        'retries': 10,
+        'fragment_retries': 10,
+        'retry_sleep': lambda n: 5 * (n + 1),  # Exponential backoff
+        'file_access_retries': 5,
+    }
+    
+    if not download:
+        return {**common_opts, 'extract_flat': True}
+        
+    if audio_only:
+        format_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'm4a',
+            }]
+        }
+    else:
+        if quality == 'best':
+            format_str = 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]'
+        elif quality == 'medium':
+            format_str = 'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]'
+        else:  # low
+            format_str = 'bestvideo[ext=mp4][height<=480]+bestaudio[ext=m4a]/best[ext=mp4][height<=480]'
+            
+        format_opts = {
+            'format': format_str,
+            'merge_output_format': 'mp4'
+        }
+    
+    return {**common_opts, **format_opts}
+
 def get_video_info(url):
     """Get video information without downloading"""
     try:
         if not url or not url.startswith(('https://www.youtube.com/', 'https://youtu.be/')):
             st.error("Please enter a valid YouTube URL")
             return None
-            
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': True,  # Only extract metadata
-        }
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return {
-                'title': info.get('title', 'Unknown'),
-                'duration': info.get('duration', 0),
-                'uploader': info.get('uploader', 'Unknown'),
-                'view_count': info.get('view_count', 0),
-                'upload_date': info.get('upload_date', 'Unknown'),
-                'thumbnail': info.get('thumbnail', None)
-            }
+        # Get yt-dlp options
+        ydl_opts = get_yt_dlp_opts(download=False)
+        
+        for attempt in range(3):  # Try up to 3 times
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info:
+                        return {
+                            'title': info.get('title', 'Unknown'),
+                            'duration': info.get('duration', 0),
+                            'uploader': info.get('uploader', 'Unknown'),
+                            'view_count': info.get('view_count', 0),
+                            'upload_date': info.get('upload_date', 'Unknown'),
+                            'thumbnail': info.get('thumbnail', None)
+                        }
+            except Exception as e:
+                if 'HTTP Error 403' in str(e) and attempt < 2:
+                    time.sleep((attempt + 1) * 5)  # Exponential backoff
+                    continue
+                else:
+                    raise
+                    
+        st.error("Could not fetch video information after multiple attempts")
+        return None
+        
     except Exception as e:
         st.error(f"Error getting video info: {str(e)}")
         return None
@@ -177,35 +245,43 @@ def download_video(url, quality='best', audio_only=False):
     """Download video from YouTube"""
     try:
         # Create temporary directory for cloud deployment
-        import tempfile
         downloads_dir = Path(tempfile.gettempdir()) / "YouTube_Downloads"
         downloads_dir.mkdir(parents=True, exist_ok=True)
         
-        if audio_only:
-            ydl_opts = {
-                'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
-                'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
-            }
-        else:
-            if quality == 'best':
-                format_selector = 'best[ext=mp4][height<=1080]/best[height<=1080]/best'
-            elif quality == 'medium':
-                format_selector = 'best[ext=mp4][height<=720]/best[height<=720]/best'
-            else:  # low
-                format_selector = 'best[ext=mp4][height<=480]/best[height<=480]/best'
-                
-            ydl_opts = {
-                'format': format_selector,
-                'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
-                'merge_output_format': 'mp4',
-            }
+        # Get yt-dlp options
+        ydl_opts = get_yt_dlp_opts(download=True, audio_only=audio_only, quality=quality)
+        ydl_opts['outtmpl'] = str(downloads_dir / '%(title)s.%(ext)s')
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-            
-        return True, str(downloads_dir)
+        for attempt in range(3):  # Try up to 3 times
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    error = ydl.download([url])
+                    if error == 0:  # Successful download
+                        return True, str(downloads_dir)
+                        
+            except Exception as e:
+                if 'HTTP Error 403' in str(e) and attempt < 2:
+                    # If we get a 403, try with a different format string
+                    ydl_opts['format'] = 'best' if not audio_only else 'bestaudio'
+                    time.sleep((attempt + 1) * 5)  # Exponential backoff
+                    continue
+                else:
+                    raise
+        
+        return False, "Failed to download after multiple attempts"
+        
     except Exception as e:
-        return False, str(e)
+        error_msg = str(e)
+        if "HTTP Error 403" in error_msg:
+            error_msg = "Access denied by YouTube. This might be due to:\n" + \
+                       "1. Regional restrictions\n" + \
+                       "2. Age-restricted content\n" + \
+                       "3. Private video\n" + \
+                       "Please try:\n" + \
+                       "- A different video quality\n" + \
+                       "- Waiting a few minutes\n" + \
+                       "- Using a different video"
+        return False, error_msg
 
 def format_duration(seconds):
     """Convert seconds to readable format"""
